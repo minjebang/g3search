@@ -169,10 +169,6 @@
 
   <script>
     // ================== CONFIG: Insert your keys here ==================
-    // 1) Create a Google Programmable Search Engine (CSE) at https://programmablesearchengine.google.com/
-    //    - Enable "Image search" in your CSE settings
-    //    - Copy your Search engine ID (cx) and an API key
-    // 2) Create a YouTube Data API key (https://console.cloud.google.com/ -> APIs & Services)
     const CONFIG = {
       GOOGLE_CSE_KEY: "", // <- REQUIRED
       GOOGLE_CSE_CX:  "", // <- REQUIRED (Search engine ID)
@@ -189,7 +185,6 @@
     const qInput = $('#q');
     const form = $('#searchForm');
     const clearBtn = $('#clearBtn');
-    const goBtn = $('#goBtn');
     const themeBtn = $('#themeBtn');
     const sunIcon = $('#sunIcon');
     const moonIcon = $('#moonIcon');
@@ -197,11 +192,23 @@
     let currentQuery = '';
     let inFlight = [];
 
+    // Pagination state for infinite scroll
+    const paging = {
+      web:   { start: 1, num: 10, loading: false, done: false },   // CSE uses 1-based start
+      image: { start: 1, num: 10, loading: false, done: false },
+      video: { pageToken: null, loading: false, done: false }
+    };
+
     function setStatus(text){ statusChip.textContent = text; }
     function showResultsArea(show) { resWrap.style.display = show ? 'block' : 'none'; }
 
     function resetColumns(){
       [webBox, imgBox, vidBox].forEach(el => el.innerHTML = '');
+    }
+    function resetPaging(){
+      paging.web =   { start: 1, num: 10, loading: false, done: false };
+      paging.image = { start: 1, num: 10, loading: false, done: false };
+      paging.video = { pageToken: null, loading: false, done: false };
     }
     function abortInFlight(){
       inFlight.forEach(c => { try { c.abort(); } catch(_){} });
@@ -219,9 +226,15 @@
     function renderLoader(target, label){
       const div = document.createElement('div');
       div.className = 'loader';
+      div.dataset.loader = 'true';
       div.innerHTML = `<div class="spinner" aria-hidden="true"></div><span>${label}</span>`;
       target.appendChild(div);
       return div;
+    }
+
+    function removeExistingLoader(target){
+      const last = Array.from(target.querySelectorAll('[data-loader]')).pop();
+      if(last) last.remove();
     }
 
     function renderEmpty(target, text){
@@ -271,69 +284,111 @@
       setStatus('Searching…');
       showResultsArea(true);
       resetColumns();
+      resetPaging();
       abortInFlight();
 
-      // Validate keys and warn per-column as needed
       const missing = ensureKeys();
       if(missing.length) {
-        // We'll still try what we can, but show guidance
         const tip = `Add your API keys (${missing.join(', ')}) in the CONFIG at the top of the file.`;
         renderEmpty(webBox, tip);
         renderEmpty(imgBox, tip);
         renderEmpty(vidBox, tip);
       }
 
-      // Kick off concurrent fetches, but each column is independent
+      // Initial page for each column
       await Promise.all([
-        fetchWeb(q),
-        fetchImages(q),
-        fetchVideos(q)
+        fetchWeb(q, /*append*/ false),
+        fetchImages(q, /*append*/ false),
+        fetchVideos(q, /*append*/ false)
       ]);
 
       setStatus('Done');
+
+      // Attach infinite scroll listeners (once per search)
+      attachInfiniteScroll(webBox,   () => fetchWeb(currentQuery, true));
+      attachInfiniteScroll(imgBox,   () => fetchImages(currentQuery, true));
+      attachInfiniteScroll(vidBox,   () => fetchVideos(currentQuery, true));
+    }
+
+    function attachInfiniteScroll(container, onNeedMore){
+      container.addEventListener('scroll', () => {
+        const nearBottom = container.scrollTop + container.clientHeight >= container.scrollHeight - 120;
+        if(nearBottom) onNeedMore();
+      });
     }
 
     // ================== Column fetchers ==================
-    async function fetchWeb(q){
-      webBox.innerHTML = '';
+    async function fetchWeb(q, append = true){
+      if(paging.web.loading || paging.web.done) return;
+      paging.web.loading = true;
+
+      if(!append) webBox.innerHTML = '';
+      removeExistingLoader(webBox);
+      const loader = renderLoader(webBox, append ? 'Loading more…' : 'Loading web results…');
+
       const aborter = new AbortController();
       inFlight.push(aborter);
-      const loader = renderLoader(webBox, 'Loading web results…');
       try {
         if(!CONFIG.GOOGLE_CSE_KEY || !CONFIG.GOOGLE_CSE_CX) throw new Error('Missing Google CSE key/cx');
         const url = new URL('https://www.googleapis.com/customsearch/v1');
         url.searchParams.set('key', CONFIG.GOOGLE_CSE_KEY);
         url.searchParams.set('cx', CONFIG.GOOGLE_CSE_CX);
         url.searchParams.set('q', q);
-        url.searchParams.set('num', '10');
+        url.searchParams.set('num', String(paging.web.num));
+        url.searchParams.set('start', String(paging.web.start)); // 1-based
+
         const res = await fetch(url, { signal: aborter.signal });
         if(!res.ok) throw new Error('Web search failed: ' + res.status);
         const data = await res.json();
+
         loader.remove();
         const items = data.items || [];
-        if(items.length === 0) return renderEmpty(webBox, 'No web results.');
-        for(const it of items){
-          const a = document.createElement('a');
+        if(items.length === 0 && !append) return renderEmpty(webBox, 'No web results.');
+        for (const it of items) {
+          const a = document.createElement('a');              // <-- create it
           a.className = 'card';
           a.href = it.link;
-          a.target = '_blank'; a.rel = 'noopener noreferrer';
+          a.target = '_blank';
+          a.rel = 'noopener noreferrer';
+
+          const snippet = (it.snippet || '')
+            .replace(/\\n|\n/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+
           a.innerHTML = `<h4>${escapeHtml(it.title || it.link)}</h4>
-                         <p>${escapeHtml((it.snippet || '').replace(/\n/g,' '))}</p>
-                         <div class="small muted">${escapeHtml(it.displayLink || '')}</div>`;
+                        <p>${escapeHtml(snippet)}</p>
+                        <div class="small muted">${escapeHtml(it.displayLink || '')}</div>`;
           webBox.appendChild(a);
+        }
+
+
+        // Advance or finish
+        const next = data.queries?.nextPage?.[0]?.startIndex;
+        if(next) {
+          paging.web.start = next;
+        } else {
+          // If API didn't provide nextPage, infer done when fewer than requested returned
+          if(items.length < paging.web.num || paging.web.start >= 91) paging.web.done = true; // CSE max ~100 results
         }
       } catch (err) {
         try { loader.remove(); } catch(_){}
-        if(err.name === 'AbortError') return;
-        renderEmpty(webBox, 'Web: ' + err.message);
+        if(err.name !== 'AbortError') renderEmpty(webBox, 'Web: ' + err.message);
+      } finally {
+        paging.web.loading = false;
       }
     }
 
-    async function fetchImages(q){
-      imgBox.innerHTML = '';
+    async function fetchImages(q, append = true){
+      if(paging.image.loading || paging.image.done) return;
+      paging.image.loading = true;
+
+      if(!append) imgBox.innerHTML = '';
+      removeExistingLoader(imgBox);
+      const loader = renderLoader(imgBox, append ? 'Loading more…' : 'Loading images…');
+
       const aborter = new AbortController();
       inFlight.push(aborter);
-      const loader = renderLoader(imgBox, 'Loading images…');
       try {
         if(!CONFIG.GOOGLE_CSE_KEY || !CONFIG.GOOGLE_CSE_CX) throw new Error('Missing Google CSE key/cx');
         const url = new URL('https://www.googleapis.com/customsearch/v1');
@@ -341,40 +396,55 @@
         url.searchParams.set('cx', CONFIG.GOOGLE_CSE_CX);
         url.searchParams.set('q', q);
         url.searchParams.set('searchType', 'image');
-        url.searchParams.set('num', '10');
+        url.searchParams.set('num', String(paging.image.num));
+        url.searchParams.set('start', String(paging.image.start));
+
         const res = await fetch(url, { signal: aborter.signal });
         if(!res.ok) throw new Error('Image search failed: ' + res.status);
         const data = await res.json();
+
         loader.remove();
         const items = data.items || [];
-        if(items.length === 0) return renderEmpty(imgBox, 'No image results.');
-        const grid = document.createElement('div');
-        grid.className = 'thumb-grid';
-        imgBox.appendChild(grid);
+        if(items.length === 0 && !append) return renderEmpty(imgBox, 'No image results.');
+
+        // Ensure we have a grid container for thumbnails
+        let grid = imgBox.querySelector('.thumb-grid');
+        if(!grid){ grid = document.createElement('div'); grid.className = 'thumb-grid'; imgBox.appendChild(grid); }
+
         for(const it of items){
           const ctx = it.image?.contextLink || it.link;
           const a = document.createElement('a');
-          a.className = 'thumb';
-          a.href = ctx; a.target = '_blank'; a.rel = 'noopener noreferrer';
+          a.className = 'thumb'; a.href = ctx; a.target = '_blank'; a.rel = 'noopener noreferrer';
           a.title = it.title || 'Open image source';
           const img = document.createElement('img');
-          img.src = it.link;
-          img.alt = it.title || 'Image result';
-          a.appendChild(img);
-          grid.appendChild(a);
+          img.loading = 'lazy'; img.src = it.link; img.alt = it.title || 'Image result';
+          a.appendChild(img); grid.appendChild(a);
+        }
+
+        const next = data.queries?.nextPage?.[0]?.startIndex;
+        if(next) {
+          paging.image.start = next;
+        } else {
+          if(items.length < paging.image.num || paging.image.start >= 91) paging.image.done = true;
         }
       } catch (err) {
         try { loader.remove(); } catch(_){}
-        if(err.name === 'AbortError') return;
-        renderEmpty(imgBox, 'Images: ' + err.message);
+        if(err.name !== 'AbortError') renderEmpty(imgBox, 'Images: ' + err.message);
+      } finally {
+        paging.image.loading = false;
       }
     }
 
-    async function fetchVideos(q){
-      vidBox.innerHTML = '';
+    async function fetchVideos(q, append = true){
+      if(paging.video.loading || paging.video.done) return;
+      paging.video.loading = true;
+
+      if(!append) vidBox.innerHTML = '';
+      removeExistingLoader(vidBox);
+      const loader = renderLoader(vidBox, append ? 'Loading more…' : 'Loading videos…');
+
       const aborter = new AbortController();
       inFlight.push(aborter);
-      const loader = renderLoader(vidBox, 'Loading videos…');
       try {
         if(!CONFIG.YOUTUBE_API_KEY) throw new Error('Missing YOUTUBE_API_KEY');
         const url = new URL('https://www.googleapis.com/youtube/v3/search');
@@ -382,20 +452,23 @@
         url.searchParams.set('type', 'video');
         url.searchParams.set('maxResults', '12');
         url.searchParams.set('q', q);
+        if(paging.video.pageToken) url.searchParams.set('pageToken', paging.video.pageToken);
         url.searchParams.set('key', CONFIG.YOUTUBE_API_KEY);
+
         const res = await fetch(url, { signal: aborter.signal });
         if(!res.ok) throw new Error('YouTube search failed: ' + res.status);
         const data = await res.json();
+
         loader.remove();
         const items = data.items || [];
-        if(items.length === 0) return renderEmpty(vidBox, 'No video results.');
+        if(items.length === 0 && !append) return renderEmpty(vidBox, 'No video results.');
+
         for(const it of items){
           const id = it.id?.videoId;
           const s = it.snippet || {};
           const href = `https://www.youtube.com/watch?v=${id}`;
           const a = document.createElement('a');
-          a.className = 'video';
-          a.href = href; a.target = '_blank'; a.rel = 'noopener noreferrer';
+          a.className = 'video'; a.href = href; a.target = '_blank'; a.rel = 'noopener noreferrer';
           a.innerHTML = `
             <div class="vthumb"><img loading="lazy" src="${thumbUrl(s.thumbnails)}" alt="${escapeHtml(s.title || 'Video thumbnail')}"/></div>
             <div class="meta">
@@ -405,10 +478,18 @@
             </div>`;
           vidBox.appendChild(a);
         }
+
+        // Handle next page token
+        if(data.nextPageToken){
+          paging.video.pageToken = data.nextPageToken;
+        } else {
+          paging.video.done = true;
+        }
       } catch (err) {
         try { loader.remove(); } catch(_){}
-        if(err.name === 'AbortError') return;
-        renderEmpty(vidBox, 'Videos: ' + err.message);
+        if(err.name !== 'AbortError') renderEmpty(vidBox, 'Videos: ' + err.message);
+      } finally {
+        paging.video.loading = false;
       }
     }
 
@@ -419,7 +500,6 @@
 
     // ================== Theme toggle (persisted) ==================
     function applyTheme(mode){
-      // mode: 'light' | 'dark'
       const b = document.body;
       if(mode === 'dark') { b.classList.remove('light'); } else { b.classList.add('light'); }
       sunIcon.style.display = (mode === 'dark') ? 'none' : '';
