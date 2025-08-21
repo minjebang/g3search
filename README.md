@@ -1,5 +1,5 @@
 # g3search
-A high performance Google search that shows 3 types of searches concurrently in 3 columns.
+A simplified Google search that shows 3 types of searches concurrently in 3 columns.
 More results are loaded in one column when scrolled to the bottom.
 
 Requires Google CSE with Custom Search JSON API, Google CX key (Programmable Search Engine), and Youtube API key to use. CSE and Youtube keys can be the same if it uses both Custom Search JSON and Youtube API.
